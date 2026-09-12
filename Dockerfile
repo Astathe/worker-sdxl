@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11-venv \
     python3.11-dev \
     python3-pip \
+    build-essential \
+    ninja-build \
     git \
     wget \
     curl \
@@ -141,7 +143,8 @@ RUN git clone https://github.com/shadowcz007/comfyui-mixlab-nodes.git && \
 # =============================================================================
 # Install RunPod SDK
 # =============================================================================
-RUN pip install runpod requests
+COPY requirements.txt /requirements.txt
+RUN pip install -r /requirements.txt
 
 # =============================================================================
 # Download all models

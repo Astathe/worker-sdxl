@@ -1,0 +1,21 @@
+.git
+.github
+.gitignore
+.dockerignore
+
+# Virtual environments
+venv/
+env/
+.env/
+__pycache__/
+*.pyc
+
+# Local ComfyUI models / outputs if any exist in the directory
+ComfyUI/
+models/
+output/
+input/
+
+# Temp files
+*.tmp
+*.temp
