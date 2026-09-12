@@ -17,6 +17,7 @@ import random
 import base64
 import urllib.request
 import urllib.parse
+import urllib.error
 
 import runpod
 from runpod.serverless.utils import rp_upload, rp_cleanup
@@ -26,12 +27,12 @@ from runpod.serverless.utils import rp_upload, rp_cleanup
 # ---------------------------------------------------------------------------
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_API_URL = f"http://{COMFY_HOST}"
-COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/ComfyUI/output")
 COMFY_TIMEOUT = int(os.environ.get("COMFY_TIMEOUT", "600"))  # seconds
 WORKFLOW_TEMPLATE_PATH = os.environ.get("WORKFLOW_TEMPLATE_PATH", "/workflow_api.json")
 
 # Loaded at startup
 WORKFLOW_TEMPLATE = None
+_INIT_DONE = False
 
 
 def load_workflow_template():
@@ -67,27 +68,32 @@ def build_workflow_from_prompt(prompt, negative_prompt=None, seed=None, width=No
 
     workflow = copy.deepcopy(WORKFLOW_TEMPLATE)
 
+    # Validate essential nodes exist
+    missing_nodes = [n for n in ["103", "104", "99", "1", "12"] if n not in workflow]
+    if missing_nodes:
+        raise RuntimeError(f"Workflow template is missing expected node IDs: {missing_nodes}. "
+                           "Please update the node IDs in handler.py if the workflow has changed.")
+
     # Inject positive prompt
-    if prompt and "103" in workflow:
+    if prompt is not None:
         workflow["103"]["inputs"]["text"] = prompt
 
     # Inject negative prompt
-    if negative_prompt and "104" in workflow:
+    if negative_prompt is not None:
         workflow["104"]["inputs"]["text"] = negative_prompt
 
     # Inject seed (random if not provided)
-    if "99" in workflow:
-        if seed is not None:
-            workflow["99"]["inputs"]["seed"] = seed
-        else:
-            workflow["99"]["inputs"]["seed"] = random.randint(0, 2**53 - 1)
+    if seed is not None:
+        workflow["99"]["inputs"]["seed"] = seed
+    else:
+        workflow["99"]["inputs"]["seed"] = random.randint(0, 2**53 - 1)
 
     # Inject width
-    if width and "1" in workflow:
+    if width is not None:
         workflow["1"]["inputs"]["value"] = width
 
     # Inject height
-    if height and "12" in workflow:
+    if height is not None:
         workflow["12"]["inputs"]["value"] = height
 
     return workflow
@@ -131,7 +137,9 @@ def queue_prompt(workflow: dict, client_id: str) -> str:
 def poll_history(prompt_id: str, timeout: int = COMFY_TIMEOUT) -> dict:
     """Poll /history/{prompt_id} until execution is finished."""
     start = time.time()
+    attempts = 0
     while time.time() - start < timeout:
+        attempts += 1
         try:
             req = urllib.request.Request(f"{COMFY_API_URL}/history/{prompt_id}")
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -145,14 +153,15 @@ def poll_history(prompt_id: str, timeout: int = COMFY_TIMEOUT) -> dict:
                 if status.get("status_str") == "error":
                     msgs = status.get("messages", [])
                     raise RuntimeError(f"ComfyUI execution failed: {msgs}")
-        except urllib.error.URLError:
-            pass  # ComfyUI may be busy
+        except urllib.error.URLError as e:
+            if attempts % 5 == 0:
+                print(f"[handler] poll_history URLError (attempt {attempts}): {e}", flush=True)
         time.sleep(2)
 
     raise TimeoutError(f"ComfyUI execution timed out after {timeout}s")
 
 
-def collect_output_images(history_entry: dict) -> list[str]:
+def collect_output_images(history_entry: dict) -> list[dict]:
     """Extract output image filenames from a history entry."""
     images = []
     outputs = history_entry.get("outputs", {})
@@ -199,24 +208,33 @@ def images_to_base64(image_infos: list[dict]) -> list[str]:
 
 def upload_images(image_infos: list[dict], job_id: str) -> list[str]:
     """Download images from ComfyUI and upload to bucket (if configured)."""
-    os.makedirs(f"/{job_id}", exist_ok=True)
+    workdir = f"/tmp/{job_id}"
+    os.makedirs(workdir, exist_ok=True)
     image_urls = []
     for index, info in enumerate(image_infos):
         img_bytes = download_image(info)
         ext = info["filename"].rsplit(".", 1)[-1].lower() if "." in info["filename"] else "png"
-        image_path = os.path.join(f"/{job_id}", f"{index}.{ext}")
+        image_path = os.path.join(workdir, f"{index}.{ext}")
         with open(image_path, "wb") as f:
             f.write(img_bytes)
 
-        if os.environ.get("BUCKET_ENDPOINT_URL", False):
-            image_url = rp_upload.upload_image(job_id, image_path)
-            image_urls.append(image_url)
+        bucket_endpoint = os.environ.get("BUCKET_ENDPOINT_URL", "")
+        # Use bucket upload if BUCKET_ENDPOINT_URL is truthy (not empty, not "0", not "false")
+        if bucket_endpoint and bucket_endpoint.lower() not in ("0", "false"):
+            try:
+                image_url = rp_upload.upload_image(job_id, image_path)
+                image_urls.append(image_url)
+            except Exception as e:
+                print(f"[handler] Failed to upload to bucket: {e}. Falling back to base64.", flush=True)
+                b64 = base64.b64encode(img_bytes).decode("utf-8")
+                mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+                image_urls.append(f"data:{mime};base64,{b64}")
         else:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
             image_urls.append(f"data:{mime};base64,{b64}")
 
-    rp_cleanup.clean([f"/{job_id}"])
+    rp_cleanup.clean([workdir])
     return image_urls
 
 
@@ -252,6 +270,14 @@ def handler(job):
       - "images": list of base64 data URIs or uploaded URLs
       - "image_url": first image URL (convenience)
     """
+    global _INIT_DONE
+    if not _INIT_DONE:
+        print("[handler] Waiting for ComfyUI to start...", flush=True)
+        wait_for_comfyui(timeout=300)
+        print("[handler] ComfyUI is ready.", flush=True)
+        load_workflow_template()
+        _INIT_DONE = True
+
     job_input = job.get("input", {})
     job_id = job.get("id", str(uuid.uuid4()))
 
@@ -345,11 +371,4 @@ def handler(job):
 # ---------------------------------------------------------------------------
 # Main — must be at module level for RunPod's scanner to detect it
 # ---------------------------------------------------------------------------
-print("[handler] Waiting for ComfyUI to start...", flush=True)
-wait_for_comfyui(timeout=300)
-print("[handler] ComfyUI is ready.", flush=True)
-
-# Load the workflow template for simple prompt mode
-load_workflow_template()
-
 runpod.serverless.start({"handler": handler})
