@@ -1,265 +1,250 @@
+"""
+RunPod Serverless Handler for ComfyUI.
+
+Accepts a full ComfyUI workflow JSON in the request, submits it to the local
+ComfyUI server via its API, waits for execution, retrieves output images, and
+returns them as base64-encoded PNGs (or uploads to a bucket).
+"""
+
 import os
+import json
+import time
+import uuid
 import base64
-
-import torch
-from diffusers import (
-    StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,
-    AutoencoderKL,
-)
-from diffusers.utils import load_image
-
-from diffusers import (
-    PNDMScheduler,
-    LMSDiscreteScheduler,
-    DDIMScheduler,
-    EulerDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-    DPMSolverSinglestepScheduler,
-)
+import urllib.request
+import urllib.parse
 
 import runpod
 from runpod.serverless.utils import rp_upload, rp_cleanup
-from runpod.serverless.utils.rp_validator import validate
 
-from schemas import INPUT_SCHEMA
-
-torch.cuda.empty_cache()
-
-
-class ModelHandler:
-    def __init__(self):
-        self.base = None
-        self.refiner = None
-        self.load_models()
-
-    def load_base(self):
-        # Load VAE from cache using identifier
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=torch.float16,
-            local_files_only=True,
-        )
-        # Load Base Pipeline from cache using identifier
-        base_pipe = StableDiffusionXLPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            vae=vae,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-            add_watermarker=False,
-            local_files_only=True,
-        ).to("cuda")
-        
-        # Enable memory optimizations
-        base_pipe.enable_xformers_memory_efficient_attention()
-        base_pipe.enable_model_cpu_offload()
-
-        return base_pipe
-
-    def load_refiner(self):
-        # Load VAE from cache using identifier
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=torch.float16,
-            local_files_only=True,
-        )
-        # Load Refiner Pipeline from cache using identifier
-        refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-refiner-1.0",
-            vae=vae,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-            add_watermarker=False,
-            local_files_only=True,
-        ).to("cuda")
-        
-        # Enable memory optimizations
-        refiner_pipe.enable_xformers_memory_efficient_attention()
-        refiner_pipe.enable_model_cpu_offload()
-
-        return refiner_pipe
-
-    def load_models(self):
-        self.base = self.load_base()
-        self.refiner = self.load_refiner()
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
+COMFY_API_URL = f"http://{COMFY_HOST}"
+COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/ComfyUI/output")
+COMFY_TIMEOUT = int(os.environ.get("COMFY_TIMEOUT", "600"))  # seconds
 
 
-MODELS = ModelHandler()
+# ---------------------------------------------------------------------------
+# ComfyUI API helpers
+# ---------------------------------------------------------------------------
+
+def wait_for_comfyui(timeout: int = 120):
+    """Block until ComfyUI is reachable."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            req = urllib.request.Request(f"{COMFY_API_URL}/system_stats")
+            with urllib.request.urlopen(req, timeout=5):
+                return True
+        except Exception:
+            time.sleep(2)
+    raise RuntimeError(f"ComfyUI did not become available within {timeout}s")
 
 
-def _save_and_upload_images(images, job_id):
+def queue_prompt(workflow: dict, client_id: str) -> str:
+    """Submit a prompt (workflow) to ComfyUI and return the prompt_id."""
+    payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{COMFY_API_URL}/prompt",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+
+    if "prompt_id" not in result:
+        raise RuntimeError(f"ComfyUI /prompt returned unexpected result: {result}")
+
+    return result["prompt_id"]
+
+
+def poll_history(prompt_id: str, timeout: int = COMFY_TIMEOUT) -> dict:
+    """Poll /history/{prompt_id} until execution is finished."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            req = urllib.request.Request(f"{COMFY_API_URL}/history/{prompt_id}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                history = json.loads(resp.read().decode("utf-8"))
+
+            if prompt_id in history:
+                entry = history[prompt_id]
+                status = entry.get("status", {})
+                if status.get("completed", False) or status.get("status_str") == "success":
+                    return entry
+                if status.get("status_str") == "error":
+                    msgs = status.get("messages", [])
+                    raise RuntimeError(f"ComfyUI execution failed: {msgs}")
+        except urllib.error.URLError:
+            pass  # ComfyUI may be busy
+        time.sleep(2)
+
+    raise TimeoutError(f"ComfyUI execution timed out after {timeout}s")
+
+
+def collect_output_images(history_entry: dict) -> list[str]:
+    """Extract output image filenames from a history entry."""
+    images = []
+    outputs = history_entry.get("outputs", {})
+    for node_id, node_output in outputs.items():
+        if "images" in node_output:
+            for img_info in node_output["images"]:
+                filename = img_info.get("filename", "")
+                subfolder = img_info.get("subfolder", "")
+                img_type = img_info.get("type", "output")
+                if filename:
+                    images.append({
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "type": img_type,
+                    })
+    return images
+
+
+def download_image(image_info: dict) -> bytes:
+    """Download an image from ComfyUI /view endpoint."""
+    params = urllib.parse.urlencode({
+        "filename": image_info["filename"],
+        "subfolder": image_info.get("subfolder", ""),
+        "type": image_info.get("type", "output"),
+    })
+    url = f"{COMFY_API_URL}/view?{params}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
+def images_to_base64(image_infos: list[dict]) -> list[str]:
+    """Download images from ComfyUI and convert to base64 data URIs."""
+    result = []
+    for info in image_infos:
+        img_bytes = download_image(info)
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        # Detect format from filename extension
+        ext = info["filename"].rsplit(".", 1)[-1].lower() if "." in info["filename"] else "png"
+        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+        result.append(f"data:{mime};base64,{b64}")
+    return result
+
+
+def upload_images(image_infos: list[dict], job_id: str) -> list[str]:
+    """Download images from ComfyUI and upload to bucket (if configured)."""
     os.makedirs(f"/{job_id}", exist_ok=True)
     image_urls = []
-    for index, image in enumerate(images):
-        image_path = os.path.join(f"/{job_id}", f"{index}.png")
-        image.save(image_path)
+    for index, info in enumerate(image_infos):
+        img_bytes = download_image(info)
+        ext = info["filename"].rsplit(".", 1)[-1].lower() if "." in info["filename"] else "png"
+        image_path = os.path.join(f"/{job_id}", f"{index}.{ext}")
+        with open(image_path, "wb") as f:
+            f.write(img_bytes)
 
         if os.environ.get("BUCKET_ENDPOINT_URL", False):
             image_url = rp_upload.upload_image(job_id, image_path)
             image_urls.append(image_url)
         else:
-            with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode("utf-8")
-                image_urls.append(f"data:image/png;base64,{image_data}")
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+            image_urls.append(f"data:{mime};base64,{b64}")
 
     rp_cleanup.clean([f"/{job_id}"])
     return image_urls
 
 
-def make_scheduler(name, config):
-    return {
-        "PNDM": PNDMScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "DDIM": DDIMScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-        "DPMSolverSinglestep": DPMSolverSinglestepScheduler.from_config(config),
-    }[name]
+# ---------------------------------------------------------------------------
+# RunPod handler
+# ---------------------------------------------------------------------------
 
-
-@torch.inference_mode()
-def generate_image(job):
+def handler(job):
     """
-    Generate an image from text using your Model
+    RunPod serverless handler.
+
+    Expects job["input"] to contain:
+      - "workflow": dict  — A full ComfyUI API-format workflow JSON (required)
+
+    Returns:
+      - "images": list of base64 data URIs or uploaded URLs
+      - "image_url": first image URL (convenience)
     """
-    # -------------------------------------------------------------------------
-    # 🐞 DEBUG LOGGING
-    # -------------------------------------------------------------------------
-    import json, pprint
+    job_input = job.get("input", {})
+    job_id = job.get("id", str(uuid.uuid4()))
 
-    # Log the exact structure RunPod delivers so we can see every nesting level.
-    print("[generate_image] RAW job dict:")
-    try:
-        print(json.dumps(job, indent=2, default=str), flush=True)
-    except Exception:
-        pprint.pprint(job, depth=4, compact=False)
+    # -----------------------------------------------------------------------
+    # Validate input
+    # -----------------------------------------------------------------------
+    workflow = job_input.get("workflow")
 
-    # -------------------------------------------------------------------------
-    # Original (strict) behaviour – assume the expected single wrapper exists.
-    # -------------------------------------------------------------------------
-    job_input = job["input"]
+    if not workflow:
+        return {"error": "Missing 'workflow' in input. Provide a full ComfyUI API-format workflow JSON."}
 
-    print("[generate_image] job['input'] payload:")
-    try:
-        print(json.dumps(job_input, indent=2, default=str), flush=True)
-    except Exception:
-        pprint.pprint(job_input, depth=4, compact=False)
-
-    # Input validation
-    try:
-        validated_input = validate(job_input, INPUT_SCHEMA)
-    except Exception as err:
-        import traceback
-
-        print("[generate_image] validate(...) raised an exception:", err, flush=True)
-        traceback.print_exc()
-        # Re-raise so RunPod registers the failure (but logs are now visible).
-        raise
-
-    print("[generate_image] validate(...) returned:")
-    try:
-        print(json.dumps(validated_input, indent=2, default=str), flush=True)
-    except Exception:
-        pprint.pprint(validated_input, depth=4, compact=False)
-
-    if "errors" in validated_input:
-        return {"error": validated_input["errors"]}
-    job_input = validated_input["validated_input"]
-
-    starting_image = job_input["image_url"]
-
-    if job_input["seed"] is None:
-        job_input["seed"] = int.from_bytes(os.urandom(2), "big")
-
-    # Create generator with proper device handling
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    generator = torch.Generator(device).manual_seed(job_input["seed"])
-
-    MODELS.base.scheduler = make_scheduler(
-        job_input["scheduler"], MODELS.base.scheduler.config
-    )
-
-    if starting_image:  # If image_url is provided, run only the refiner pipeline
-        init_image = load_image(starting_image).convert("RGB")
-        with torch.inference_mode():
-            refiner_result = MODELS.refiner(
-                prompt=job_input["prompt"],
-                num_inference_steps=job_input["refiner_inference_steps"],
-                strength=job_input["strength"],
-                image=init_image,
-                generator=generator,
-            )
-            output = refiner_result.images
-    else:
+    if isinstance(workflow, str):
         try:
-            # Generate latent image using base pipeline
-            with torch.inference_mode():
-                base_result = MODELS.base(
-                    prompt=job_input["prompt"],
-                    negative_prompt=job_input["negative_prompt"],
-                    height=job_input["height"],
-                    width=job_input["width"],
-                    num_inference_steps=job_input["num_inference_steps"],
-                    guidance_scale=job_input["guidance_scale"],
-                    denoising_end=job_input["high_noise_frac"],
-                    output_type="latent",
-                    num_images_per_prompt=job_input["num_images"],
-                    generator=generator,
-                )
-                image = base_result.images
+            workflow = json.loads(workflow)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON in 'workflow': {e}"}
 
-            # Debug: Log tensor info
-            if hasattr(image, 'dtype'):
-                print(f"[DEBUG] Base output dtype: {image.dtype}, shape: {image.shape}", flush=True)
-            elif isinstance(image, list) and len(image) > 0:
-                print(f"[DEBUG] Base output list, first item dtype: {image[0].dtype}, shape: {image[0].shape}", flush=True)
+    # -----------------------------------------------------------------------
+    # Submit to ComfyUI
+    # -----------------------------------------------------------------------
+    client_id = str(uuid.uuid4())
 
-            # Ensure latent images have correct dtype for refiner
-            if hasattr(image, 'dtype') and hasattr(image, 'to'):
-                image = image.to(dtype=torch.float16)
-            elif isinstance(image, list) and len(image) > 0 and hasattr(image[0], 'dtype'):
-                image = [img.to(dtype=torch.float16) for img in image]
-            
-            # Refine the image
-            with torch.inference_mode():
-                refiner_result = MODELS.refiner(
-                    prompt=job_input["prompt"],
-                    num_inference_steps=job_input["refiner_inference_steps"],
-                    strength=job_input["strength"],
-                    image=image,
-                    num_images_per_prompt=job_input["num_images"],
-                    generator=generator,
-                )
-                output = refiner_result.images
-        except RuntimeError as err:
-            print(f"[ERROR] RuntimeError in generation pipeline: {err}", flush=True)
-            return {
-                "error": f"RuntimeError: {err}, Stack Trace: {err.__traceback__}",
-                "refresh_worker": True,
-            }
-        except Exception as err:
-            print(f"[ERROR] Unexpected error in generation pipeline: {err}", flush=True)
-            return {
-                "error": f"Unexpected error: {err}",
-                "refresh_worker": True,
-            }
+    try:
+        print(f"[handler] Job {job_id}: Submitting workflow to ComfyUI...", flush=True)
+        prompt_id = queue_prompt(workflow, client_id)
+        print(f"[handler] Job {job_id}: prompt_id = {prompt_id}", flush=True)
+    except Exception as e:
+        print(f"[handler] Job {job_id}: Failed to queue prompt: {e}", flush=True)
+        return {"error": f"Failed to queue prompt: {e}"}
 
-    image_urls = _save_and_upload_images(output, job["id"])
+    # -----------------------------------------------------------------------
+    # Wait for completion
+    # -----------------------------------------------------------------------
+    try:
+        print(f"[handler] Job {job_id}: Waiting for execution...", flush=True)
+        history_entry = poll_history(prompt_id, timeout=COMFY_TIMEOUT)
+        print(f"[handler] Job {job_id}: Execution complete!", flush=True)
+    except TimeoutError as e:
+        print(f"[handler] Job {job_id}: Timeout: {e}", flush=True)
+        return {"error": str(e), "refresh_worker": True}
+    except RuntimeError as e:
+        print(f"[handler] Job {job_id}: Execution error: {e}", flush=True)
+        return {"error": str(e), "refresh_worker": True}
+
+    # -----------------------------------------------------------------------
+    # Collect output images
+    # -----------------------------------------------------------------------
+    image_infos = collect_output_images(history_entry)
+
+    if not image_infos:
+        print(f"[handler] Job {job_id}: WARNING - No output images found!", flush=True)
+        return {"error": "Workflow completed but produced no output images."}
+
+    print(f"[handler] Job {job_id}: Found {len(image_infos)} output image(s)", flush=True)
+
+    # -----------------------------------------------------------------------
+    # Return results
+    # -----------------------------------------------------------------------
+    try:
+        image_urls = upload_images(image_infos, job_id)
+    except Exception as e:
+        print(f"[handler] Job {job_id}: Error processing images: {e}", flush=True)
+        return {"error": f"Error processing output images: {e}"}
 
     results = {
         "images": image_urls,
-        "image_url": image_urls[0],
-        "seed": job_input["seed"],
+        "image_url": image_urls[0] if image_urls else None,
     }
-
-    if starting_image:
-        results["refresh_worker"] = True
 
     return results
 
 
-runpod.serverless.start({"handler": generate_image})
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("[handler] Waiting for ComfyUI to start...", flush=True)
+    wait_for_comfyui(timeout=300)
+    print("[handler] ComfyUI is ready. Starting RunPod handler...", flush=True)
+    runpod.serverless.start({"handler": handler})
