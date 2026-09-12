@@ -5,7 +5,7 @@ set -euo pipefail
 # Startup script: Launch ComfyUI server, then start the RunPod handler
 # =============================================================================
 
-COMFY_DIR="${COMFY_DIR:-/ComfyUI}"
+COMFY_DIR="${COMFY_DIR:-/comfyui}"
 
 echo "[start.sh] Starting ComfyUI server..."
 cd "$COMFY_DIR"
