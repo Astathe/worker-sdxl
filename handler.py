@@ -343,16 +343,14 @@ def handler(job):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — must be at module level for RunPod's scanner to detect it
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("[handler] Waiting for ComfyUI to start...", flush=True)
-    wait_for_comfyui(timeout=300)
-    print("[handler] ComfyUI is ready.", flush=True)
+print("[handler] Waiting for ComfyUI to start...", flush=True)
+wait_for_comfyui(timeout=300)
+print("[handler] ComfyUI is ready.", flush=True)
 
-    # Load the workflow template for simple prompt mode
-    load_workflow_template()
+# Load the workflow template for simple prompt mode
+load_workflow_template()
 
-    print("[handler] Starting RunPod handler...", flush=True)
-    runpod.serverless.start({"handler": handler})
-
+print("[handler] Starting RunPod handler...", flush=True)
+runpod.serverless.start({"handler": handler})
