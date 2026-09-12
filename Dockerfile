@@ -32,7 +32,7 @@ RUN comfy-node-install \
 RUN comfy model download --url https://huggingface.co/LyliaEngine/waiIllustriousSDXL_v170/resolve/main/waiIllustriousSDXL_v170.safetensors --relative-path models/checkpoints --filename waiIllustriousSDXL_v170.safetensors
 
 # LoRA
-RUN comfy model download --url "https://civitai.com/api/download/models/1930892?fileId=1829094" --relative-path models/loras --filename civitai_lora_1930892.safetensors
+RUN comfy model download --url "https://huggingface.co/Astathe/uma/resolve/main/UmaDiffusionXL_4th.safetensors?download=true" --relative-path models/loras --filename UmaDiffusionXL_4th.safetensors
 
 # VAE
 RUN comfy model download --url https://huggingface.co/stabilityai/sdxl-vae/resolve/main/sdxl_vae.safetensors --relative-path models/vae/SDXL --filename sdxl_vae.safetensors
