@@ -16,8 +16,8 @@
         "lastAccepted": {
           "start": 70,
           "end": 106,
-          "insertedText": "<lora:Flat painting style-000020:1>,",
-          "textSnapshot": "<lora:UmaDiffusionXL_4th:0.70> <lora:illustrious_flat_color_v2:0.70>,\n<lora:Flat painting style-000020:1>,"
+          "insertedText": "<<lora:UmaDiffusionXL_4th:0.70>,",
+          "textSnapshot": "<lora:UmaDiffusionXL_4th:0.70>,"
         }
       },
       "text": "<lora:UmaDiffusionXL_4th:0.70>",

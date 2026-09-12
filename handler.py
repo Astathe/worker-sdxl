@@ -1,15 +1,19 @@
 """
 RunPod Serverless Handler for ComfyUI.
 
-Accepts a full ComfyUI workflow JSON in the request, submits it to the local
-ComfyUI server via its API, waits for execution, retrieves output images, and
-returns them as base64-encoded PNGs (or uploads to a bucket).
+Supports two modes:
+  1. Full workflow mode: pass a complete ComfyUI API-format workflow JSON.
+  2. Simple prompt mode: pass just a prompt (and optionally negative_prompt,
+     seed, width, height) — the handler injects them into the baked-in
+     workflow template.
 """
 
 import os
 import json
+import copy
 import time
 import uuid
+import random
 import base64
 import urllib.request
 import urllib.parse
@@ -24,6 +28,69 @@ COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_API_URL = f"http://{COMFY_HOST}"
 COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/ComfyUI/output")
 COMFY_TIMEOUT = int(os.environ.get("COMFY_TIMEOUT", "600"))  # seconds
+WORKFLOW_TEMPLATE_PATH = os.environ.get("WORKFLOW_TEMPLATE_PATH", "/workflow_api.json")
+
+# Loaded at startup
+WORKFLOW_TEMPLATE = None
+
+
+def load_workflow_template():
+    """Load the baked-in workflow template for simple prompt mode."""
+    global WORKFLOW_TEMPLATE
+    if os.path.exists(WORKFLOW_TEMPLATE_PATH):
+        with open(WORKFLOW_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+            WORKFLOW_TEMPLATE = json.load(f)
+        print(f"[handler] Loaded workflow template from {WORKFLOW_TEMPLATE_PATH}", flush=True)
+    else:
+        print(f"[handler] WARNING: No workflow template found at {WORKFLOW_TEMPLATE_PATH}. "
+              "Simple prompt mode will be unavailable.", flush=True)
+
+
+def build_workflow_from_prompt(prompt, negative_prompt=None, seed=None, width=None, height=None):
+    """
+    Build a ComfyUI workflow by injecting simple parameters into the
+    baked-in Advanced_Gemma_V38 UMA workflow template.
+
+    Node mapping (from the API-format workflow):
+      - Node "103" (TextBoxMira, title "POSITIVE"): positive prompt text
+      - Node "104" (TextBoxMira, title "NEGATIVE"): negative prompt text
+      - Node "99"  (Seed_): seed value
+      - Node "1"   (easy int, title "Width"): width
+      - Node "12"  (easy int, title "Height"): height
+    """
+    if WORKFLOW_TEMPLATE is None:
+        raise RuntimeError(
+            "No workflow template loaded. Cannot use simple prompt mode. "
+            "Either provide a full 'workflow' JSON, or ensure the template "
+            f"exists at {WORKFLOW_TEMPLATE_PATH}."
+        )
+
+    workflow = copy.deepcopy(WORKFLOW_TEMPLATE)
+
+    # Inject positive prompt
+    if prompt and "103" in workflow:
+        workflow["103"]["inputs"]["text"] = prompt
+
+    # Inject negative prompt
+    if negative_prompt and "104" in workflow:
+        workflow["104"]["inputs"]["text"] = negative_prompt
+
+    # Inject seed (random if not provided)
+    if "99" in workflow:
+        if seed is not None:
+            workflow["99"]["inputs"]["seed"] = seed
+        else:
+            workflow["99"]["inputs"]["seed"] = random.randint(0, 2**53 - 1)
+
+    # Inject width
+    if width and "1" in workflow:
+        workflow["1"]["inputs"]["value"] = width
+
+    # Inject height
+    if height and "12" in workflow:
+        workflow["12"]["inputs"]["value"] = height
+
+    return workflow
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +228,25 @@ def handler(job):
     """
     RunPod serverless handler.
 
-    Expects job["input"] to contain:
-      - "workflow": dict  — A full ComfyUI API-format workflow JSON (required)
+    Supports two input modes:
+
+    Mode 1 — Full workflow (advanced):
+      {
+        "input": {
+          "workflow": { ... full ComfyUI API-format workflow ... }
+        }
+      }
+
+    Mode 2 — Simple prompt (uses baked-in workflow template):
+      {
+        "input": {
+          "prompt": "your positive prompt here",
+          "negative_prompt": "optional negative prompt",
+          "seed": 12345,
+          "width": 1024,
+          "height": 1536
+        }
+      }
 
     Returns:
       - "images": list of base64 data URIs or uploaded URLs
@@ -172,18 +256,36 @@ def handler(job):
     job_id = job.get("id", str(uuid.uuid4()))
 
     # -----------------------------------------------------------------------
-    # Validate input
+    # Determine mode: full workflow or simple prompt
     # -----------------------------------------------------------------------
     workflow = job_input.get("workflow")
 
-    if not workflow:
-        return {"error": "Missing 'workflow' in input. Provide a full ComfyUI API-format workflow JSON."}
-
-    if isinstance(workflow, str):
+    if workflow:
+        # Mode 1: Full workflow JSON
+        if isinstance(workflow, str):
+            try:
+                workflow = json.loads(workflow)
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid JSON in 'workflow': {e}"}
+        print(f"[handler] Job {job_id}: Using full workflow mode", flush=True)
+    elif job_input.get("prompt"):
+        # Mode 2: Simple prompt — inject into baked-in template
         try:
-            workflow = json.loads(workflow)
-        except json.JSONDecodeError as e:
-            return {"error": f"Invalid JSON in 'workflow': {e}"}
+            workflow = build_workflow_from_prompt(
+                prompt=job_input["prompt"],
+                negative_prompt=job_input.get("negative_prompt"),
+                seed=job_input.get("seed"),
+                width=job_input.get("width"),
+                height=job_input.get("height"),
+            )
+            print(f"[handler] Job {job_id}: Using simple prompt mode", flush=True)
+        except RuntimeError as e:
+            return {"error": str(e)}
+    else:
+        return {
+            "error": "Missing input. Provide either 'workflow' (full ComfyUI API JSON) "
+                     "or 'prompt' (simple text prompt)."
+        }
 
     # -----------------------------------------------------------------------
     # Submit to ComfyUI
@@ -246,5 +348,11 @@ def handler(job):
 if __name__ == "__main__":
     print("[handler] Waiting for ComfyUI to start...", flush=True)
     wait_for_comfyui(timeout=300)
-    print("[handler] ComfyUI is ready. Starting RunPod handler...", flush=True)
+    print("[handler] ComfyUI is ready.", flush=True)
+
+    # Load the workflow template for simple prompt mode
+    load_workflow_template()
+
+    print("[handler] Starting RunPod handler...", flush=True)
     runpod.serverless.start({"handler": handler})
+

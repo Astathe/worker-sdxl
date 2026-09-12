@@ -128,6 +128,16 @@ RUN git clone https://github.com/1038lab/ComfyUI-QwenVL.git && \
     cd ComfyUI-QwenVL && \
     if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+# ComfyUI_Mira (provides TextBoxMira node)
+RUN git clone https://github.com/mirabarukaso/ComfyUI_Mira.git && \
+    cd ComfyUI_Mira && \
+    if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+# comfyui-mixlab-nodes (provides Seed_ / CreateSeedNode node)
+RUN git clone https://github.com/shadowcz007/comfyui-mixlab-nodes.git && \
+    cd comfyui-mixlab-nodes && \
+    if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
 # =============================================================================
 # Install RunPod SDK
 # =============================================================================
@@ -147,6 +157,7 @@ WORKDIR /
 COPY handler.py /handler.py
 COPY start.sh /start.sh
 COPY "Advanced_Gemma_V38 UMA.json" "/workflow.json"
+COPY "Advanced_Gemma_V38 UMA API.json" "/workflow_api.json"
 RUN chmod +x /start.sh
 
 # =============================================================================
