@@ -352,6 +352,4 @@ print("[handler] ComfyUI is ready.", flush=True)
 # Load the workflow template for simple prompt mode
 load_workflow_template()
 
-print("[handler] Starting RunPod handler...", flush=True)
-
 runpod.serverless.start({"handler": handler})
