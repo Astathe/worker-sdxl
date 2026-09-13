@@ -48,7 +48,7 @@ RUN comfy model download --url https://huggingface.co/h94/IP-Adapter/resolve/mai
 RUN comfy model download --url https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sdxl.bin --relative-path models/ipadapter --filename ip-adapter-faceid-plusv2_sdxl.bin
 
 # CLIP Vision
-RUN comfy model download --url https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/resolve/main/open_clip_pytorch_model.safetensors --relative-path models/clip_vision --filename CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors
+RUN comfy model download --url https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/resolve/main/model.safetensors?download=true --relative-path models/clip_vision --filename CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors
 RUN comfy model download --url https://huggingface.co/stabilityai/control-lora/resolve/main/revision/clip_vision_g.safetensors --relative-path models/clip_vision --filename clip_vision_g.safetensors
 
 # Upscale Models
