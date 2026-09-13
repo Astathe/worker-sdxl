@@ -22,6 +22,18 @@
   ],
   "config": {
     "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuTypeIdList": [
+      "NVIDIA GeForce RTX 4090",
+      "NVIDIA RTX A5000",
+      "NVIDIA RTX A6000",
+      "NVIDIA RTX 3090",
+      "NVIDIA RTX 3090 Ti",
+      "NVIDIA L40S",
+      "NVIDIA A40",
+      "NVIDIA A100 80GB PCIe",
+      "NVIDIA A100-SXM4-80GB",
+      "NVIDIA H100 PCIe"
+    ],
     "gpuCount": 1,
     "allowedCudaVersions": [
       "12.7",
