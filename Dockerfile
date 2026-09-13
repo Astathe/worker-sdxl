@@ -28,6 +28,10 @@ RUN comfy-node-install \
 # =============================================================================
 # Download Models
 # =============================================================================
+# Switch to bash — required for array syntax (pids=(), pids+=($!)) used below.
+# /bin/sh (dash) is Docker's default and does not support bash arrays.
+SHELL ["/bin/bash", "-c"]
+
 # All models are downloaded in parallel to stay within the 30-minute build limit.
 # Each download is backgrounded (&); pids are collected and checked individually
 # so the build fails immediately if any single download exits non-zero.
