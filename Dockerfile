@@ -1,5 +1,5 @@
 # Start from the official RunPod worker-comfyui base image
-FROM runpod/worker-comfyui:5.8.8-base
+FROM runpod/worker-comfyui:5.8.5-base
 
 # =============================================================================
 # Install Custom Nodes
