@@ -1,12 +1,11 @@
 # Start from the official RunPod worker-comfyui base image
-FROM runpod/worker-comfyui:5.1.0-base
+FROM runpod/worker-comfyui:5.8.8-base
 
 # =============================================================================
 # Install Custom Nodes
 # =============================================================================
 # We use the GitHub URLs to ensure we get exactly the repos previously installed.
 RUN comfy-node-install \
-    https://github.com/Comfy-Org/ComfyUI-Manager \
     https://github.com/ltdrdata/ComfyUI-Impact-Pack \
     https://github.com/ltdrdata/ComfyUI-Impact-Subpack \
     https://github.com/yolain/ComfyUI-Easy-Use \

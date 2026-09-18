@@ -1,7 +1,6 @@
 {
   "input": {
     "workflow": {
-      "_comment": "Replace this with your full ComfyUI API-format workflow JSON. This is a minimal example placeholder.",
       "3": {
         "class_type": "KSampler",
         "inputs": {
@@ -11,10 +10,22 @@
           "sampler_name": "euler",
           "scheduler": "normal",
           "denoise": 1.0,
-          "model": ["4", 0],
-          "positive": ["6", 0],
-          "negative": ["7", 0],
-          "latent_image": ["5", 0]
+          "model": [
+            "4",
+            0
+          ],
+          "positive": [
+            "6",
+            0
+          ],
+          "negative": [
+            "7",
+            0
+          ],
+          "latent_image": [
+            "5",
+            0
+          ]
         }
       },
       "4": {
@@ -35,28 +46,43 @@
         "class_type": "CLIPTextEncode",
         "inputs": {
           "text": "A majestic steampunk dragon soaring through a cloudy sky, intricate clockwork details, golden hour lighting, highly detailed",
-          "clip": ["4", 1]
+          "clip": [
+            "4",
+            1
+          ]
         }
       },
       "7": {
         "class_type": "CLIPTextEncode",
         "inputs": {
           "text": "blurry, low quality, deformed, ugly, text, watermark, signature",
-          "clip": ["4", 1]
+          "clip": [
+            "4",
+            1
+          ]
         }
       },
       "8": {
         "class_type": "VAEDecode",
         "inputs": {
-          "samples": ["3", 0],
-          "vae": ["4", 2]
+          "samples": [
+            "3",
+            0
+          ],
+          "vae": [
+            "4",
+            2
+          ]
         }
       },
       "9": {
         "class_type": "SaveImage",
         "inputs": {
           "filename_prefix": "ComfyUI",
-          "images": ["8", 0]
+          "images": [
+            "8",
+            0
+          ]
         }
       }
     }
